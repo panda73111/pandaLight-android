@@ -7,28 +7,39 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
-import android.os.ParcelUuid;
-import android.support.v7.app.ActionBarActivity;
 import android.os.Bundle;
+import android.support.v7.app.ActionBarActivity;
 import android.util.Log;
 import android.view.Menu;
 import android.view.MenuItem;
 import android.view.View;
 import android.widget.Button;
+import android.widget.TextView;
 
 import java.io.IOException;
+import java.io.OutputStream;
+import java.util.Random;
 import java.util.Set;
 import java.util.UUID;
 
 
 public class MainActivity extends ActionBarActivity
 {
-    private final static String TAG               = "MainActivity";
-    private final static int    REQUEST_ENABLE_BT = 1;
-    private static BluetoothBroadcastReceiver btBroadcastReceiver = null;
-    private static BluetoothAdapter           btAdapter = null;
-    private static BluetoothSocket btSocket = null;
-    private final UUID pandaLightUuid = UUID.fromString("56F46190-A07D-11E4-BCD8-0800200C9A66");
+    private enum CONNECTION_STATE
+    {
+        CONNECTION_STATE_UNCONNECTED,
+        CONNECTION_STATE_DISCOVERY,
+        CONNECTION_STATE_CONNECTED
+    }
+
+    private              CONNECTION_STATE           connectionState      = CONNECTION_STATE.CONNECTION_STATE_UNCONNECTED;
+    private final static String                     TAG                  = "MainActivity";
+    private final static int                        REQUEST_ENABLE_BT    = 1;
+    private static       BluetoothBroadcastReceiver btBroadcastReceiver  = null;
+    private static       BluetoothAdapter           btAdapter            = null;
+    private static       BluetoothSocket            btSocket             = null;
+    private final        String                     pandaLightDeviceName = "pandaLight";
+    private final        UUID                       pandaLightUuid       = UUID.fromString("56F46190-A07D-11E4-BCD8-0800200C9A66");
 
     @Override
     protected void onCreate(Bundle savedInstanceState)
@@ -39,10 +50,11 @@ public class MainActivity extends ActionBarActivity
         btBroadcastReceiver = new BluetoothBroadcastReceiver();
         btAdapter = BluetoothAdapter.getDefaultAdapter();
 
-        final Button button = (Button) findViewById(R.id.button_connect);
-        button.setOnClickListener(
+        final Button connectButton = (Button) findViewById(R.id.button_connect);
+        connectButton.setOnClickListener(
                 new View.OnClickListener()
                 {
+                    @Override
                     public void onClick(View v)
                     {
                         startBluetoothDiscovery();
@@ -50,8 +62,56 @@ public class MainActivity extends ActionBarActivity
                 }
         );
 
+        final Button disconnectButton = (Button) findViewById(R.id.button_disconnect);
+        disconnectButton.setOnClickListener(
+                new View.OnClickListener()
+                {
+                    @Override
+                    public void onClick(View v)
+                    {
+                        if (btSocket == null || !btSocket.isConnected())
+                            return;
+
+                        try
+                        {
+                            btSocket.close();
+                        }
+                        catch (IOException ex)
+                        { }
+                        connectionState = CONNECTION_STATE.CONNECTION_STATE_UNCONNECTED;
+                        onConnectionStateChanged();
+                    }
+                }
+        );
+
+        final Button sendDataButton = (Button) findViewById(R.id.button_sendData);
+        sendDataButton.setOnClickListener(
+                new View.OnClickListener()
+                {
+                    @Override
+                    public void onClick(View v)
+                    {
+                        if (btSocket == null || !btSocket.isConnected())
+                            return;
+
+                        try
+                        {
+                            OutputStream stream = btSocket.getOutputStream();
+                            byte buffer[] = new byte[1024];
+                            new Random().nextBytes(buffer);
+                            stream.write(buffer);
+                            stream.flush();
+                        }
+                        catch (IOException ex)
+                        { }
+                    }
+                }
+        );
+
         // Register the BroadcastReceiver
-        IntentFilter filter = new IntentFilter(BluetoothDevice.ACTION_FOUND);
+        IntentFilter filter = new IntentFilter();
+        filter.addAction(BluetoothDevice.ACTION_FOUND);
+        filter.addAction(BluetoothAdapter.ACTION_DISCOVERY_FINISHED);
         registerReceiver(btBroadcastReceiver, filter);
     }
 
@@ -93,7 +153,12 @@ public class MainActivity extends ActionBarActivity
             return;
 
         listPairedDevices();
-        btAdapter.startDiscovery();
+        if (connectionState == CONNECTION_STATE.CONNECTION_STATE_UNCONNECTED)
+        {
+            btAdapter.startDiscovery();
+            connectionState = CONNECTION_STATE.CONNECTION_STATE_DISCOVERY;
+            onConnectionStateChanged();
+        }
     }
 
     private void listPairedDevices()
@@ -122,30 +187,13 @@ public class MainActivity extends ActionBarActivity
 
     private void handleBluetoothDevice(BluetoothDevice device)
     {
+        final String deviceName = device.getName();
         Log.d(
                 TAG, "Got BT device: " +
-                        device.getName() + " - " + device.getAddress()
+                        deviceName + " - " + device.getAddress()
         );
-        ParcelUuid[] uuidList = device.getUuids();
-        if (uuidList == null)
-        {
-            if (device.fetchUuidsWithSdp())
-                Log.d(TAG, "Starting search for service UUIDs");
-            else
-                Log.w(TAG, "Fetching UUIDs of device " + device.getName() + " failed!");
-            return;
-        }
-        for (ParcelUuid uuid : uuidList)
-            handleServiceUuid(device, uuid.getUuid());
-    }
-
-    private void handleServiceUuid(BluetoothDevice device, UUID uuid)
-    {
-        Log.d(TAG, "Service: " + uuid.toString());
-        if (uuid.equals(pandaLightUuid))
-        {
-            Log.d(TAG, "Found pandaLight service");
-        }
+        if (deviceName.equals(pandaLightDeviceName))
+            initiateBluetoothConnection(device, pandaLightUuid);
     }
 
     private class BluetoothBroadcastReceiver extends BroadcastReceiver
@@ -162,11 +210,13 @@ public class MainActivity extends ActionBarActivity
                 BluetoothDevice device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
                 handleBluetoothDevice(device);
             }
-            else if (BluetoothDevice.ACTION_UUID.equals(action))
+            else if (BluetoothAdapter.ACTION_DISCOVERY_FINISHED.equals(action))
             {
-                BluetoothDevice device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
-                ParcelUuid uuid = intent.getParcelableExtra(BluetoothDevice.EXTRA_UUID);
-                handleServiceUuid(device, uuid.getUuid());
+                if (connectionState == CONNECTION_STATE.CONNECTION_STATE_DISCOVERY)
+                {
+                    connectionState = CONNECTION_STATE.CONNECTION_STATE_UNCONNECTED;
+                    onConnectionStateChanged();
+                }
             }
         }
     }
@@ -175,13 +225,81 @@ public class MainActivity extends ActionBarActivity
     {
         try
         {
+            if (btSocket != null && btSocket.isConnected())
+                btSocket.close();
+        }
+        catch (IOException ex)
+        { }
+        try
+        {
             btSocket = device.createRfcommSocketToServiceRecord(uuid);
             btSocket.connect();
             Log.d(TAG, "Successfully opened a connection");
+            if (btAdapter.isDiscovering())
+                btAdapter.cancelDiscovery();
+            connectionState = CONNECTION_STATE.CONNECTION_STATE_CONNECTED;
+            onConnectionStateChanged();
         }
         catch (IOException ex)
         {
             Log.e(TAG, "Establishing a connection to device " + device.getName() + " failed!");
+            connectionState = CONNECTION_STATE.CONNECTION_STATE_UNCONNECTED;
+            onConnectionStateChanged();
         }
+    }
+
+    private void onConnectionStateChanged()
+    {
+        final TextView connectionStateTextView = (TextView) findViewById(R.id.textView_connectionState);
+        final Button sendDataButton = (Button) findViewById(R.id.button_sendData);
+        final Button connectButton = (Button) findViewById(R.id.button_connect);
+        final Button disconnectButton = (Button) findViewById(R.id.button_disconnect);
+        String connectionStateString = "";
+        boolean sendDataButtonEnabled = false;
+        int connectButtonVisibility = Button.VISIBLE;
+        int disconnectButtonVisibility = Button.INVISIBLE;
+        boolean connectButtonEnabled = true;
+        switch (connectionState)
+        {
+            case CONNECTION_STATE_CONNECTED:
+                connectionStateString = "connected";
+                sendDataButtonEnabled = true;
+                connectButtonVisibility = Button.INVISIBLE;
+                disconnectButtonVisibility = Button.VISIBLE;
+                break;
+            case CONNECTION_STATE_DISCOVERY:
+                connectionStateString = "searching...";
+                connectButtonEnabled = false;
+                break;
+            case CONNECTION_STATE_UNCONNECTED:
+                connectionStateString = "unconnected";
+                break;
+        }
+        connectionStateTextView.setText(connectionStateString);
+        connectButton.setVisibility(connectButtonVisibility);
+        connectButton.setEnabled(connectButtonEnabled);
+        disconnectButton.setVisibility(disconnectButtonVisibility);
+        sendDataButton.setEnabled(sendDataButtonEnabled);
+    }
+
+    @Override
+    protected void onResume()
+    {
+        super.onResume();
+        onConnectionStateChanged();
+    }
+
+    @Override
+    protected void onPause()
+    {
+        super.onPause();
+        if (btSocket == null || !btSocket.isConnected())
+            return;
+        try
+        {
+            btSocket.close();
+        }
+        catch (IOException ex)
+        { }
     }
 }
